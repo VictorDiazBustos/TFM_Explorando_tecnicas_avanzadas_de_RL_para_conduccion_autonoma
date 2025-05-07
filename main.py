@@ -15,15 +15,17 @@ from agents.base_agent import BaseAgent
 from config import CONFIG
 import pandas as pd
 import matplotlib.pyplot as plt
+import seaborn as sns
 
 
-def create_env(config, gui=False, is_eval=False, STATE_DIM=52, port: Optional[int] = None):
+def create_env(config, gui=False, alg_name: str = None, is_eval=False, STATE_DIM=59, port: Optional[int] = None):
     """Crea una instancia del entorno SUMO."""
     sumo_cfg = config['env']['sumo_config_eval'] if is_eval else config['env']['sumo_config_train']
     return SUMOEnvironment(
         sumo_config=sumo_cfg,
         max_steps=config['env']['max_steps'],
         gui=gui,
+        alg_name=alg_name,
         STATE_DIM=STATE_DIM,
         port=port
     )
@@ -63,7 +65,7 @@ def plot_metrics(df: pd.DataFrame, metrics: list[str], save_dir: str, prefix: st
                 plt.savefig(plot_filename)
                 print(f"Gráfico guardado: {plot_filename}")
             except Exception as e:
-                 print(f"Error guardando gráfico {plot_filename}: {e}")
+                print(f"Error guardando gráfico {plot_filename}: {e}")
             plt.close() # Cerrar la figura para liberar memoria
         else:
             print(f"Advertencia: Métrica '{metric}' no encontrada en el DataFrame para {prefix}.")
@@ -82,9 +84,9 @@ def train_std_agent(agent: BaseAgent, env: SUMOEnvironment, config: Dict, alg_na
     metrics_log: Dict[str, list] = {
         'Episodio': [],
         'Recompensa_Episodio': [],
-        'Pasos_Episodio': [],
-        'Pasos_Totales': [],
         'Recompensa_Promedio_Movil': [],
+        'Pasos_Episodio': [],
+        'Pasos_Promedio_Movil': [],
         'Metas_Alcanzadas_Episodio': [],
         'Metas_Alcanzadas_Promedio_Movil': [],
     }
@@ -96,7 +98,7 @@ def train_std_agent(agent: BaseAgent, env: SUMOEnvironment, config: Dict, alg_na
 
     episode_rewards = deque(maxlen=print_interval) # Almacenar recompensas recientes para promedio
     episode_goals = deque(maxlen=print_interval)   # Almacenar las metas alcanzadas recientes para promedio
-    total_steps = 0
+    episode_steps = deque(maxlen=print_interval)   # Almacenar las pasos alcanzados recientes para promedio
     next_save_episode = 1 # Inicializar el próximo número de episodio para guardar
 
     for episode in range(1, num_episodes + 1):
@@ -127,7 +129,6 @@ def train_std_agent(agent: BaseAgent, env: SUMOEnvironment, config: Dict, alg_na
                 goals_reached += 1
 
             episode_reward += reward
-            total_steps += 1
             step += 1
 
             if alg_name == "ppo":
@@ -140,12 +141,7 @@ def train_std_agent(agent: BaseAgent, env: SUMOEnvironment, config: Dict, alg_na
                 memory_attr = getattr(agent, 'memory', None)
                 batch_size_key = config[alg_name].get('batch_size')
                 if memory_attr is not None and batch_size_key is not None and len(memory_attr) >= batch_size_key:
-                    # TODO:
                     loss_dict = agent.train()
-                    # try:
-                    #     loss_dict = agent.train()
-                    # except Exception as e:
-                    #     print(f"Error durante agent.train() para {alg_name}: {e}")
 
             state = next_state
 
@@ -171,11 +167,13 @@ def train_std_agent(agent: BaseAgent, env: SUMOEnvironment, config: Dict, alg_na
         avg_reward = np.mean(episode_rewards)
         episode_goals.append(goals_reached)
         avg_goals = np.mean(episode_goals)
+        episode_steps.append(step)
+        avg_steps = np.mean(episode_steps)
         metrics_log['Episodio'].append(episode)
         metrics_log['Recompensa_Episodio'].append(episode_reward)
-        metrics_log['Pasos_Episodio'].append(step)
-        metrics_log['Pasos_Totales'].append(total_steps)
         metrics_log['Recompensa_Promedio_Movil'].append(avg_reward)
+        metrics_log['Pasos_Episodio'].append(step)
+        metrics_log['Pasos_Promedio_Movil'].append(avg_steps)
         metrics_log['Metas_Alcanzadas_Episodio'].append(goals_reached)
         metrics_log['Metas_Alcanzadas_Promedio_Movil'].append(avg_goals)
 
@@ -191,7 +189,7 @@ def train_std_agent(agent: BaseAgent, env: SUMOEnvironment, config: Dict, alg_na
 
         if episode % print_interval == 0:
             loss_str = ", ".join([f"{k}: {v[-1]:.3f}" for k, v in metrics_log.items() if k not in ['Episodio', 'Recompensa_Episodio', 'Pasos_Episodio', 'Pasos_Totales', 'Recompensa_Promedio_Movil'] and not np.isnan(v[-1])])
-            print(f"Alg: {alg_name.upper()} | Episodio: {episode}/{num_episodes} | Pasos: {step} | Pasos Totales: {total_steps} | Recompensa Ep: {episode_reward:.2f} | Recompensa Prom (Últimos {print_interval}): {avg_reward:.2f} | Metas Ep: {goals_reached} | Pérdida {loss_str}")
+            print(f"Alg: {alg_name.upper()} | Episodio: {episode}/{num_episodes} | Pasos: {step} | Recompensa Ep: {episode_reward:.2f} | Recompensa Prom (Últimos {print_interval}): {avg_reward:.2f} | Metas Ep: {goals_reached} | Pérdida {loss_str}")
             if 'loss_dict' in locals():
                 print(f"\tLosses: {loss_dict}")
 
@@ -232,7 +230,7 @@ def train_std_agent(agent: BaseAgent, env: SUMOEnvironment, config: Dict, alg_na
         df_final.to_csv(csv_filename, index=False)
         print(f"CSV final guardado en {csv_filename}")
         # Generar gráficos
-        plot_metrics_list = ['Recompensa_Episodio', 'Recompensa_Promedio_Movil', 'Pasos_Episodio', 'Metas_Alcanzadas_Episodio', 'Metas_Alcanzadas_Promedio_Movil']
+        plot_metrics_list = ['Recompensa_Episodio', 'Recompensa_Promedio_Movil', 'Pasos_Episodio', 'Pasos_Promedio_Movil', 'Metas_Alcanzadas_Episodio', 'Metas_Alcanzadas_Promedio_Movil']
         # Añadir pérdidas que realmente se registraron
         plot_metrics_list.extend([k for k, v in metrics_log.items() if k in possible_losses and any(not np.isnan(val) for val in v)])
         plot_metrics(df_final, plot_metrics_list, results_dir, f"train_{alg_name}")
@@ -444,11 +442,12 @@ def main():
 
     # Usar un entorno sin GUI para la configuración para evitar ventanas emergentes innecesarias
     
-    BASE_STATE_COMPONENTS = 12
+    BASE_STATE_COMPONENTS = 15
     MAX_NEARBY_VEHICLES = 8
     FEATURES_PER_VEHICLE = 5
     VEHICLE_STATE_COMPONENTS = MAX_NEARBY_VEHICLES * FEATURES_PER_VEHICLE
-    DEFAULT_STATE_DIM = BASE_STATE_COMPONENTS + VEHICLE_STATE_COMPONENTS
+    TRAFFIC_LIGHT_COMPONENTS = 4
+    DEFAULT_STATE_DIM = BASE_STATE_COMPONENTS + VEHICLE_STATE_COMPONENTS + TRAFFIC_LIGHT_COMPONENTS
     DEFAULT_ACTION_DIM = 8
     temp_env = None
     try:
@@ -495,11 +494,11 @@ def main():
     else:
         print(f"Ruta absoluta al config SUMO: {absolute_config_path}")
 
-    # env_creator = lambda gui_flag=False, port=None: create_env(CONFIG, gui=gui_flag, is_eval=(args.mode == 'eval'), port=port)
-    env_creator = lambda gui_flag=False, port=None: SUMOEnvironment(
+    env_creator = lambda gui_flag=False, alg_name=None, port=None: SUMOEnvironment(
         sumo_config=absolute_config_path,
         max_steps=CONFIG['env']['max_steps'],
         gui=gui_flag,
+        alg_name=alg_name,
         port=port,
         STATE_DIM=state_dim
     )
@@ -507,7 +506,6 @@ def main():
     print(f"Creando agente: {args.alg.upper()}")
     try:
         # Crear agente
-        # agent = create_agent(args.alg, state_dim, action_dim, CONFIG, env_creator=env_creator)
         agent = create_agent(
             args.alg,
             state_dim,
@@ -576,8 +574,9 @@ def main():
 
         # Crear entorno de evaluación
         eval_env = None
+        eval_alg_name = f"eval_{args.alg}"
         try:
-            eval_env = env_creator(gui_flag=args.gui)
+            eval_env = env_creator(gui_flag=args.gui, alg_name=eval_alg_name)
         except Exception as e:
             print(f"Error creando el entorno de evaluación: {e}")
             exit(1)

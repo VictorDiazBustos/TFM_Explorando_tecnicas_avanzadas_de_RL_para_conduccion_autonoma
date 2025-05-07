@@ -42,6 +42,9 @@ class SUMOEnvironment:
     }
     MAX_EXPECTED_SPEED = 33.33 # m/s
     DEFAULT_PORT = 8813
+    MAX_MAP_COORD_X = 2000.0
+    MAX_MAP_COORD_Y = 2500.0
+    MAX_EDGE_LEN = 500.0
     
     def __init__(
         self, 
@@ -51,9 +54,10 @@ class SUMOEnvironment:
         route_type_id: str = "passenger",
         max_steps: int = 6000,
         gui: bool = True,
+        alg_name: str = None,
         detection_radius: float = 50.0,
         reward_weights: Dict[str, float] = None,
-        STATE_DIM: int = 52,
+        STATE_DIM: int = 59,
         port: Optional[int] = None,
     ):
         self.sumo_config = sumo_config
@@ -62,10 +66,10 @@ class SUMOEnvironment:
         self.route_type_id = route_type_id
         self.max_steps = max_steps
         self.gui = gui
+        self.alg_name = alg_name
         self.detection_radius = detection_radius
         self.STATE_DIM = STATE_DIM
-        self.port = port 
-
+        self.port = port
         
         # Pesos para la función de recompensa
         self.reward_weights = reward_weights or self.DEFAULT_REWARD_WEIGHTS
@@ -502,30 +506,6 @@ class SUMOEnvironment:
         return [sorted_edges[0]]
         
     def _assign_new_route(self) -> Optional[List[str]]:
-        # TODO: Eliminar version antigua
-        # """
-        # Asigna una nueva ruta al vehículo desde su posición actual.
-        # Se busca en los enlaces (links) del carril actual y se selecciona uno aleatoriamente.
-        # """
-        # try:
-        #     current_edge = traci.vehicle.getRoadID(self.vehicle_id)
-        #     current_lane = traci.vehicle.getLaneID(self.vehicle_id)
-        #     links = traci.lane.getLinks(current_lane)
-        #     valid_links = [link for link in links if link[1] is True]
-        #     if valid_links:
-        #         selected_link = random.choice(valid_links)
-        #         next_lane = selected_link[0]
-        #         next_edge = traci.lane.getEdgeID(next_lane)
-        #         new_route = [current_edge, next_edge]
-        #         traci.vehicle.setRoute(self.vehicle_id, new_route)
-        #         print(f"Nueva ruta asignada: {new_route}")
-        #         return new_route
-        #     else:
-        #         print("No hay enlaces válidos para asignar nueva ruta desde", current_lane)
-        #         return None
-        # except Exception as e:
-        #     print(f"Error al asignar nueva ruta: {e}")
-        #     return None
         """
         Asigna una nueva ruta al vehículo desde su edge actual.
         """
@@ -701,34 +681,6 @@ class SUMOEnvironment:
                 
         elif action in [5, 6, 7]:  # Maniobras en intersección
             current_lane = traci.vehicle.getLaneID(self.vehicle_id)
-            """
-            # Solo aplicar si no estamos en una intersección
-            if ":" not in current_lane:
-                links = traci.lane.getLinks(current_lane)
-                
-                if links:
-                    # Filtrar links según la dirección deseada
-                    if action == 5:  # Girar izquierda
-                        direction_links = [link for link in links if link[6] == 'l']
-                    elif action == 6:  # Girar derecha
-                        direction_links = [link for link in links if link[6] == 'r']
-                    else:  # Seguir recto
-                        direction_links = [link for link in links if link[6] == 's']
-                    
-                    if direction_links:
-                        # Tomar el primer link disponible con la dirección deseada
-                        next_lane = direction_links[0][0]
-                        next_edge = traci.lane.getEdgeID(next_lane)
-                        current_edge = traci.vehicle.getRoadID(self.vehicle_id)
-                        
-                        try:
-                            # Intentar directamente con el edge de destino
-                            traci.vehicle.setRoute(self.vehicle_id, [current_edge, next_edge])
-                        except:
-                            pass  # Ignorar errores de ruta
-                        
-                                    # Obtenemos todos los enlaces disponibles desde el carril actual
-            """
             links = traci.lane.getLinks(current_lane)
             # Forzamos la maniobra, incluso si no hay enlaces válidos
             if links:
@@ -779,7 +731,6 @@ class SUMOEnvironment:
             # Devolver un estado de "dummy" con ceros
             return np.zeros(self.STATE_DIM)
             
-        # try:
         # 1. Información básica del vehículo
         position = traci.vehicle.getPosition(self.vehicle_id)
         speed = traci.vehicle.getSpeed(self.vehicle_id)
@@ -805,11 +756,9 @@ class SUMOEnvironment:
         if not in_intersection and edge_id != "":
             lane_count = traci.edge.getLaneNumber(edge_id)
             edge_speed_limit = traci.lane.getMaxSpeed(lane_id)
-            lane_width = traci.lane.getWidth(lane_id)
         else:
             lane_count = 1
             edge_speed_limit = 13.9  # ~50 km/h como valor predeterminado
-            lane_width = 3.2  # Ancho estándar de carril
         
         # 3. Detección de vehículos cercanos
         nearby_vehicles = []
@@ -904,11 +853,33 @@ class SUMOEnvironment:
             pass # Puede fallar si no hay semáforos en la ruta
         except Exception as e_tls:
             print(f"Error obteniendo info TLS: {e_tls}")
+
+        # 6. Información del Edge Destino ---
+        target_edge_rel_end_x = 0.0
+        target_edge_rel_end_y = 0.0
+        target_edge_norm_len = 0.0
+        target_edge_id = None
+
+        route = traci.vehicle.getRoute(self.vehicle_id)
+        if route and len(route) > 1:
+            target_edge_id = route[-1] # El último edge de la ruta actual (que es de 2 edges)
+            target_lane_id = f"{target_edge_id}_0" # Usar el carril 0 como referencia
+            target_shape = traci.lane.getShape(target_lane_id)
+            target_len = traci.lane.getLength(target_lane_id)
+            if target_shape:
+                target_end_pos = target_shape[-1] # Coordenadas absolutas del final del carril
+                # Calcular posición relativa al vehículo actual
+                rel_x = target_end_pos[0] - position[0]
+                rel_y = target_end_pos[1] - position[1]
+                # Rotar al marco de referencia del vehículo
+                target_edge_rel_end_x = (rel_x * angle_cos + rel_y * angle_sin) / self.MAX_MAP_COORD_X
+                target_edge_rel_end_y = (-rel_x * angle_sin + rel_y * angle_cos) / self.MAX_MAP_COORD_Y
+            target_edge_norm_len = target_len / self.MAX_EDGE_LEN
         
         # Compilar todo el estado
         state_components = [
-            position[0] / 1000.0,
-            position[1] / 1000.0,
+            position[0] / self.MAX_MAP_COORD_X,
+            position[1] / self.MAX_MAP_COORD_Y,
             speed / self.MAX_EXPECTED_SPEED,
             angle_sin,
             angle_cos,
@@ -919,7 +890,10 @@ class SUMOEnvironment:
             int(next_links[0]),
             int(next_links[1]),
             int(next_links[2]),
-        ] # 12 componentes
+            target_edge_rel_end_x,
+            target_edge_rel_end_y,
+            target_edge_norm_len
+        ] # 15 componentes
         
         # Añadir información de vehículos cercanos
         for vehicle in nearby_vehicles:
@@ -931,7 +905,7 @@ class SUMOEnvironment:
 
         final_state = np.array(state_components, dtype=np.float32)
         # Verificar dimensión final antes de retornar
-        EXPECTED_DIM = 56 # Actualizar según los componentes añadidos
+        EXPECTED_DIM = 59 # Actualizar según los componentes añadidos
         if final_state.shape[0] != EXPECTED_DIM:
             print(f"ERROR INTERNO: Dimensión de estado inesperada {final_state.shape[0]}, se esperaba {EXPECTED_DIM}")
             # Devolver ceros con la dimensión correcta
@@ -939,9 +913,6 @@ class SUMOEnvironment:
 
         return final_state
             
-        # except Exception as e:
-        #     print(f"Error al obtener estado: {e}")
-        #     return np.zeros(self.STATE_DIM)  # Estado dummy en caso de error
     
     def _get_nearby_vehicles(self, position: Tuple[float, float], radius: float) -> Dict[str, Dict]:
         """Obtiene información de vehículos cercanos en un radio determinado"""
@@ -1159,7 +1130,8 @@ class SUMOEnvironment:
         if self.simulation_running:
             try:
                 if traci.isLoaded():
-                    self._generate_video()
+                    if self.alg_name:
+                        self._generate_video()
                     traci.close()
             except:
                 print(f"Error durante traci.close(){port_info}: {e}")
@@ -1176,7 +1148,7 @@ class SUMOEnvironment:
     def _save_frame(self):
         """Guarda una captura de pantalla de la simulación en el paso actual."""
         os.makedirs("frames", exist_ok=True)
-        frame_filename = f"frames/frame_{self.current_step:04d}.png"
+        frame_filename = f"frames/frame_{self.alg_name}_{self.current_step:04d}.png"
         traci.gui.screenshot("View #0", frame_filename)
 
     def _generate_video(self):
@@ -1187,7 +1159,7 @@ class SUMOEnvironment:
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-y",
-            "episode.mp4"                        # Nombre del video de salida
+            f"{self.alg_name}_episode.mp4"                        # Nombre del video de salida
         ]
         try:
             subprocess.run(comando, check=True)
