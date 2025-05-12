@@ -5,6 +5,9 @@ import random
 import time
 import subprocess
 import os
+import json
+
+from config import CONFIG
 
 
 SCREEN_WIDTH = 1400
@@ -59,6 +62,7 @@ class SUMOEnvironment:
         reward_weights: Dict[str, float] = None,
         STATE_DIM: int = 59,
         port: Optional[int] = None,
+        eval_route: list[str] = []
     ):
         self.sumo_config = sumo_config
         self.vehicle_id = vehicle_id
@@ -70,6 +74,8 @@ class SUMOEnvironment:
         self.detection_radius = detection_radius
         self.STATE_DIM = STATE_DIM
         self.port = port
+        self.eval_route = eval_route
+        self.current_edge_goal = 0
         
         # Pesos para la función de recompensa
         self.reward_weights = reward_weights or self.DEFAULT_REWARD_WEIGHTS
@@ -150,7 +156,7 @@ class SUMOEnvironment:
         if not self.simulation_running:
             raise RuntimeError(f"No se pudo iniciar la simulación de SUMO después de varios intentos (Puerto {traci_port})")
         
-    def reset(self) -> np.ndarray:
+    def reset(self, eval_route: list[str] = []) -> np.ndarray:
         """Reinicia el entorno y devuelve el estado inicial"""
         # Cerrar la simulación si está en ejecución
         if self.simulation_running:
@@ -179,6 +185,8 @@ class SUMOEnvironment:
         self.last_action = None
         self.forced_collision = False
         self.last_dist_to_end = None
+        self.eval_route = eval_route
+        self.current_edge_goal = 0
 
         
         # Añadir vehículo a la simulación
@@ -206,49 +214,39 @@ class SUMOEnvironment:
         if not traci.isLoaded():
             raise RuntimeError("TraCI no está conectado, no se puede añadir vehículo")
             
-        # TODO: eliminar codigo comentado
-        # Obtener edges válidos
-        edges = traci.edge.getIDList()
-        
-        # Verificar que hay edges disponibles
-        if not edges:
-            raise ValueError("No hay edges disponibles en la simulación")
+        if self.eval_route:
+            route = self.eval_route
+            start_edge = route[self.current_edge_goal]
+            self.current_edge_goal += 1
+            dest_edge = route[self.current_edge_goal]
+            self._add_poi(dest_edge)
+        else:
+            # Obtener edges válidos
+            edges = traci.edge.getIDList()
+            
+            # Verificar que hay edges disponibles
+            if not edges:
+                raise ValueError("No hay edges disponibles en la simulación")
 
-        # Encontrar par de edges aleatorios (inicio, destino)
-        # start_edge, next_edge = self._find_random_start()
+            # Encontrar edge de inicio aleatorio
+            start_edge = self._find_random_start_edge(edges)
+            if start_edge is None:
+                raise ValueError("No se pudo encontrar un edge de inicio aleatorio válido.")
 
-        # if start_edge is None or next_edge is None:
-        #     raise ValueError("No se pudo encontrar una ruta inicial aleatoria válida.")
-
-        # Encontrar edge de inicio aleatorio
-        start_edge = self._find_random_start_edge(edges)
-        if start_edge is None:
-            raise ValueError("No se pudo encontrar un edge de inicio aleatorio válido.")
-
-        # Encontrar edge de destino aleatorio desde el inicio
-        next_edge = self._find_random_next_edge(start_edge, edges)
-        if next_edge is None:
-            raise ValueError(f"No se pudo encontrar un destino válido ni siquiera desde {start_edge}.")
+            # Encontrar edge de destino aleatorio desde el inicio
+            dest_edge = self._find_random_next_edge(start_edge, edges)
+            if dest_edge is None:
+                raise ValueError(f"No se pudo encontrar un destino válido ni siquiera desde {start_edge}.")
 
         # Crear la ruta inicial
-        initial_route = [start_edge, next_edge]
+        route = [start_edge, dest_edge]
         route_id = f"{self.vehicle_id}_route_{random.randint(1000, 9999)}"
-            
         try:
-            # route = self._get_valid_route(edges)
-            
-            # # Crear ruta
-            # route_id = f"{self.vehicle_id}_route"
-            # if route_id in traci.route.getIDList():
-            #     traci.route.remove(route_id)
-            
-            # traci.route.add(route_id, route)
-
             # Añadir la nueva ruta (eliminar si existe una con el mismo ID es buena práctica, aunque poco probable aquí)
             if route_id in traci.route.getIDList():
                 traci.route.remove(route_id)
-            traci.route.add(route_id, initial_route)
-            print(f"Ruta inicial aleatoria creada: {route_id} = {initial_route}")
+            traci.route.add(route_id, route)
+            print(f"Ruta inicial creada: {route_id} = {route}")
 
             # Eliminar vehículo anterior si aún existe (importante en reset)
             if self.vehicle_id in traci.vehicle.getIDList():
@@ -258,7 +256,6 @@ class SUMOEnvironment:
                 traci.simulationStep() # Avanzar un paso para procesar la eliminación
             
             # Añadir vehículo
-            # traci.vehicle.add(self.vehicle_id, route_id, depart="now", typeID=self.vehicle_type)
             traci.vehicle.add(
                 vehID=self.vehicle_id,
                 routeID=route_id,
@@ -268,7 +265,7 @@ class SUMOEnvironment:
                 departPos="random",  # Empezar en una posición aleatoria del carril
                 departSpeed="0"      # Empezar parado o con velocidad aleatoria "random" / "max"
             )
-            print(f"Vehículo '{self.vehicle_id}' añadido en edge '{start_edge}' con ruta a '{next_edge}'.")
+            print(f"Vehículo '{self.vehicle_id}' añadido en edge '{start_edge}' con ruta a '{dest_edge}'.")
 
             # Esperar a que el vehículo realmente entre en la simulación
             step = 0
@@ -505,13 +502,24 @@ class SUMOEnvironment:
         # Devolver al menos un edge válido (el más largo si fue posible ordenarlos)
         return [sorted_edges[0]]
         
-    def _assign_new_route(self) -> Optional[List[str]]:
+    def _assign_new_route(self) -> Optional[List[str]] | dict:
         """
         Asigna una nueva ruta al vehículo desde su edge actual.
         """
         if not self.vehicle_active or self.vehicle_id not in traci.vehicle.getIDList():
             print("Error en _assign_new_route: Vehículo no activo.")
             return None
+
+        if self.eval_route:
+            if self.current_edge_goal < len(self.eval_route):
+                new_route_edges = self.eval_route[self.current_edge_goal: self.current_edge_goal+2]
+                self.current_edge_goal += 1
+                self._add_poi(new_route_edges[-1])
+                return new_route_edges
+            else:
+                print("¡Final de la ruta de evualuación alzancado!")
+                return {"success": True}
+                
 
         try:
             current_edge = traci.vehicle.getRoadID(self.vehicle_id)
@@ -854,7 +862,7 @@ class SUMOEnvironment:
         except Exception as e_tls:
             print(f"Error obteniendo info TLS: {e_tls}")
 
-        # 6. Información del Edge Destino ---
+        # 6. Información del Edge Destino
         target_edge_rel_end_x = 0.0
         target_edge_rel_end_y = 0.0
         target_edge_norm_len = 0.0
@@ -1095,6 +1103,11 @@ class SUMOEnvironment:
 
                     # Intentar asignar nueva ruta
                     new_route = self._assign_new_route()
+                    print(f"------ new_route: {new_route} ------")
+
+                    if isinstance(new_route, dict) and new_route.get("success") == True:
+                        info["terminal"] = "evaluation_route_completed"
+
                     if new_route is not None:
                         info["new_route_assigned"] = True
                         self.last_dist_to_end = None
@@ -1167,5 +1180,99 @@ class SUMOEnvironment:
         except subprocess.CalledProcessError as e:
             print(f"Error al generar el video: {e}")
 
-
     
+    @staticmethod
+    def generate_eval_routes(output_file: str, num_routes: int = 20, route_length: int = 5):
+        print("Generando rutas de evaluación...")
+        
+        temp_config_path = os.path.abspath(CONFIG['env']['sumo_config_eval'])
+        if not os.path.exists(temp_config_path):
+            print(f"Error: Archivo de configuración SUMO no encontrado en {temp_config_path}")
+            return
+
+        all_generated_routes = []
+        temp_env = None
+        MAX_NEXT_EDGE_ATTEMPTS = 100
+
+        try:
+            sumo_binary = "sumo"
+            if os.environ.get("SUMO_HOME"):
+                sumo_binary = os.path.join(os.environ["SUMO_HOME"], "bin", sumo_binary)
+
+            # Iniciar SUMO una vez para obtener la lista completa de edges
+            print("Obteniendo lista de edges del mapa...")
+            traci.start([sumo_binary, "-c", temp_config_path, "--quit-on-end", "--no-step-log"], port=None, label="route_gen_edgelist")
+            initial_edges_list = traci.edge.getIDList()
+            print(f"Obtenidos {len(initial_edges_list)} edges del mapa.")
+            traci.close(False)
+            time.sleep(0.5)
+
+            # Crear una instancia de SUMOEnvironment para usar sus métodos de búsqueda
+            temp_env = SUMOEnvironment(sumo_config=temp_config_path, gui=False, STATE_DIM=1)
+
+            routes = []
+            while len(routes) < num_routes:
+                current_route = []
+
+                # Encontrar el primer edge (start_edge)
+                start_edge = temp_env._find_random_start_edge(initial_edges_list)
+                if not start_edge:
+                    print("No se pudo encontrar un start_edge válido, reintentando...")
+                    time.sleep(0.1)
+                    continue
+
+                current_route.append(start_edge)
+                last_edge_in_route = start_edge
+
+                # Encontrar los edges siguientes
+                route_valid = True
+                for edge_num in range(1, route_length): # Necesitamos route_length - 1 edges más
+                    next_edge_found_for_segment = False
+                    for attempt in range(MAX_NEXT_EDGE_ATTEMPTS):
+                        # Los métodos _find* dentro de temp_env deberían usar la conexión TraCI de temp_env
+                        next_edge = temp_env._find_random_next_edge(last_edge_in_route, initial_edges_list)
+                        if next_edge and next_edge not in current_route: # Evitar bucles simples inmediatos
+                            current_route.append(next_edge)
+                            last_edge_in_route = next_edge
+                            next_edge_found_for_segment = True
+                            break # Salir del bucle de intentos para este segmento
+                        else:
+                            print(f"  Intento {attempt+1} para edge {edge_num+1} desde {last_edge_in_route} no válido o repetido ({next_edge}).")
+
+                    if not next_edge_found_for_segment:
+                        print(f"No se pudo encontrar el edge {edge_num+1} para la ruta actual comenzando con {current_route[0]}. Descartando ruta.")
+                        route_valid = False
+                        break # Salir del bucle de construcción de esta ruta
+
+                if route_valid and len(current_route) == route_length:
+                    all_generated_routes.append(current_route) # Guardar como lista de strings
+                    routes.append(current_route)
+                    print(f"Ruta {len(routes)}/{num_routes} encontrada: {current_route}")
+                else:
+                    print(f"Ruta descartada (longitud: {len(current_route)}): {current_route}")
+
+
+            if len(all_generated_routes) < num_routes:
+                print(f"ADVERTENCIA: Solo se generaron {len(all_generated_routes)} de las {num_routes} rutas largas solicitadas.")
+
+            temp_env.close() # Cerrar el entorno temporal
+            print("\nLista de rutas generada:")
+            print("EVAL_ROUTES = [")
+            for r in routes:
+                print(f"    ('{r[0]}', '{r[1]}'),")
+            print("]")
+
+            with open(output_file, 'w') as f:
+                json.dump(routes, f, indent=4)
+
+        except Exception as e:
+            print(f"Error generando rutas: {e}")
+            if traci.isLoaded():
+                traci.close()
+            raise Exception(e)
+
+    @staticmethod
+    def load_eval_routes_long(routes_filepath: str):
+        with open(routes_filepath, 'r') as f:
+            return json.load(f)
+

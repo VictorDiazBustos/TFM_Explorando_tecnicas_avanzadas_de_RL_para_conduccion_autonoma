@@ -284,7 +284,7 @@ def check_success(info, done, steps, max_steps):
             return 1 # Considerémoslo éxito por ahora si no hubo fallo grave
     return 0
 
-def evaluate_agent(agent: BaseAgent, env: SUMOEnvironment, config: dict, alg_name: str, save_dir: str):
+def evaluate_agent(agent: BaseAgent, env: SUMOEnvironment, config: dict, alg_name: str, save_dir: str, routes_filepath):
     """Evalúa un agente entrenado."""
     print(f"\n--- Iniciando Evaluación: {alg_name.upper()} ---")
     num_episodes = config['evaluation']['num_episodes']
@@ -320,8 +320,10 @@ def evaluate_agent(agent: BaseAgent, env: SUMOEnvironment, config: dict, alg_nam
         except Exception as e:
             print(f"Advertencia: No se pudo poner el agente en modo eval: {e}")
 
-    for episode in range(1, num_episodes + 1):
-        state = env.reset()
+    routes = SUMOEnvironment.load_eval_routes_long(routes_filepath)
+
+    for episode, route in zip(range(1, num_episodes + 1), routes):
+        state = env.reset(route)
         episode_reward = 0
         step = 0
         done = False
@@ -379,7 +381,7 @@ def evaluate_agent(agent: BaseAgent, env: SUMOEnvironment, config: dict, alg_nam
             agent_module.train()
             print("Agente puesto de nuevo en modo entrenamiento.")
         except Exception as e:
-             print(f"Advertencia: No se pudo poner el agente en modo train: {e}")
+            print(f"Advertencia: No se pudo poner el agente en modo train: {e}")
 
     # Calcular y mostrar promedios finales
     avg_reward = np.mean(eval_metrics_log['Recompensa_Eval'])
@@ -421,6 +423,7 @@ def main():
     parser.add_argument("--save_dir", type=str, default="models", help="Directorio para guardar modelos entrenados y puntos de control.")
     parser.add_argument("--gui", action="store_true", help="Habilitar GUI de SUMO durante entrenamiento/evaluación.")
     parser.add_argument("--clipping", action="store_true", default=True, help="Habilitar recorte de gradientes.")
+    parser.add_argument("--gen_eval_routes", action="store_true", default=False, help="Generar nuevas rutas de evaluación.")
 
     args = parser.parse_args()
 
@@ -518,6 +521,9 @@ def main():
         print(f"Error creando el agente '{args.alg}': {e}")
         exit(1)
 
+    if args.gen_eval_routes:
+        SUMOEnvironment.generate_eval_routes(output_file="eval_routes.json")
+
     # Ejecución
     if args.mode == "train":
         print(f"Iniciando modo entrenamiento para {args.alg.upper()}...")
@@ -582,7 +588,8 @@ def main():
             exit(1)
 
         if eval_env:
-            evaluate_agent(agent, eval_env, CONFIG, args.alg, args.save_dir)
+            routes_filepath = os.path.join(os.getcwd(), "eval_routes.json")
+            evaluate_agent(agent, eval_env, CONFIG, args.alg, args.save_dir, routes_filepath)
 
 if __name__ == "__main__":
     main()
