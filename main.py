@@ -12,6 +12,7 @@ from agents.a3c_agent import A3CAgent
 from agents.ppo_agent import PPOAgent
 from agents.sac_agent import SACAgent
 from agents.base_agent import BaseAgent
+from codecarbon import EmissionsTracker
 from config import CONFIG
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -72,173 +73,200 @@ def plot_metrics(df: pd.DataFrame, metrics: list[str], save_dir: str, prefix: st
 
 def train_std_agent(agent: BaseAgent, env: SUMOEnvironment, config: Dict, alg_name: str, save_dir: str):
     """Bucle de entrenamiento estándar para DDQN, PPO, SAC con guardado exponencial."""
-    print(f"--- Iniciando Entrenamiento: {alg_name.upper()} ---")
-    num_episodes = config['training']['num_episodes']
-    print_interval = config['training']['print_interval']
 
-    results_dir = os.path.join(save_dir, "results") # Directorio para CSVs y gráficos
+    results_dir = os.path.join(save_dir, "results")
     os.makedirs(results_dir, exist_ok=True)
-    csv_filename = os.path.join(results_dir, f"train_{alg_name}_metrics.csv")
 
-    # Métricas a registrar
-    metrics_log: Dict[str, list] = {
-        'Episodio': [],
-        'Recompensa_Episodio': [],
-        'Recompensa_Promedio_Movil': [],
-        'Pasos_Episodio': [],
-        'Pasos_Promedio_Movil': [],
-        'Metas_Alcanzadas_Episodio': [],
-        'Metas_Alcanzadas_Promedio_Movil': [],
-    }
-    
-    # Inicializar listas para pérdidas comunes (si existen en loss_dict)
-    possible_losses = ['loss', 'policy_loss', 'value_loss', 'actor_loss', 'critic_loss', 'entropy_loss', 'alpha_loss', 'alpha', 'epsilon']
-    for loss_name in possible_losses:
-        metrics_log[loss_name] = []
+    # Crear un directorio para los reportes de CodeCarbon si no existe
+    codecarbon_output_dir = os.path.join(results_dir, "codecarbon_reports")
+    os.makedirs(codecarbon_output_dir, exist_ok=True)
 
-    episode_rewards = deque(maxlen=print_interval) # Almacenar recompensas recientes para promedio
-    episode_goals = deque(maxlen=print_interval)   # Almacenar las metas alcanzadas recientes para promedio
-    episode_steps = deque(maxlen=print_interval)   # Almacenar las pasos alcanzados recientes para promedio
-    next_save_episode = 1 # Inicializar el próximo número de episodio para guardar
+    tracker = EmissionsTracker(
+        project_name=f"Train_{alg_name.upper()}",
+        output_dir=codecarbon_output_dir,
+        log_level="info",
+        tracking_mode="process",
+        measure_power_secs=10,
+        output_file=f"emissions_{alg_name}_train.csv"
+    )
+    tracker.start()
+    print(f"CodeCarbon tracker iniciado para {alg_name}. Reportes en: {codecarbon_output_dir}")
 
-    for episode in range(1, num_episodes + 1):
-        state = env.reset()
-        episode_reward = 0
-        step = 0
-        goals_reached = 0
-        done = False
-        if hasattr(agent, 'memory_ready'): # Reiniciar flag de memoria de PPO si el agente lo tiene
-            agent.memory_ready = False
+    try:
+        print(f"--- Iniciando Entrenamiento: {alg_name.upper()} ---")
+        num_episodes = config['training']['num_episodes']
+        print_interval = config['training']['print_interval']
+        csv_filename = os.path.join(results_dir, f"train_{alg_name}_metrics.csv")
+
+        # Métricas a registrar
+        metrics_log: Dict[str, list] = {
+            'Episodio': [],
+            'Recompensa_Episodio': [],
+            'Recompensa_Promedio_Movil': [],
+            'Pasos_Episodio': [],
+            'Pasos_Promedio_Movil': [],
+            'Metas_Alcanzadas_Episodio': [],
+            'Metas_Alcanzadas_Promedio_Movil': [],
+        }
         
-        episode_losses = {loss_name: [] for loss_name in possible_losses} # Para promediar pérdidas del episodio
-
-        while not done:
-            if alg_name == "ppo" and agent.memory_ready:
-                try:
-                    loss_dict = agent.train(last_state=state, last_done=done)
-                    for key, value in loss_dict.items():
-                        if key in episode_losses:
-                            episode_losses[key].append(value)
-                except Exception as e_train:
-                    print(f"Error durante agent.train() [PPO Pre-Action] en episodio {episode}: {e_train}")
-
-            action = agent.select_action(state)
-            next_state, reward, done, info = env.step(action)
-
-            if info.get("segment_goal_reached", False):
-                goals_reached += 1
-
-            episode_reward += reward
-            step += 1
-
-            if alg_name == "ppo":
-                # PPO almacena el resultado después del paso
-                agent.store_outcome(reward, done)
-            elif alg_name in ["ddqn", "sac"]:
-                # DDQN/SAC almacenan la transición completa
-                agent.store_transition(state, action, reward, next_state, done)
-                # Verificar si la memoria del agente (buffer) tiene suficientes muestras
-                memory_attr = getattr(agent, 'memory', None)
-                batch_size_key = config[alg_name].get('batch_size')
-                if memory_attr is not None and batch_size_key is not None and len(memory_attr) >= batch_size_key:
-                    loss_dict = agent.train()
-
-            state = next_state
-
-            if done:
-                # Si PPO terminó el episodio antes de n_steps, entrenar con datos parciales
-                if alg_name == "ppo" and not agent.memory_ready:
-                    # Verificar si hay alg con qué entrenar
-                    if hasattr(agent, 'memory') and len(agent.memory.get('states', [])) > 0:
-                        print(f"PPO Episodio {episode} terminó temprano, entrenando con datos parciales ({len(agent.memory['states'])} pasos)...")
-                        try: 
-                            loss_dict = agent.train(last_state=state, last_done=done)
-                            for key, value in loss_dict.items():
-                                if key in episode_losses:
-                                    episode_losses[key].append(value)
-                        except Exception as e:
-                            print(f"Error durante agent.train() [PPO Post-Done] en episodio {episode}: {e}")
-                    if hasattr(agent, 'memory_ready'):
-                        agent.memory_ready = False
-                break
-
-        # Registro de Métricas del Episodio
-        episode_rewards.append(episode_reward)
-        avg_reward = np.mean(episode_rewards)
-        episode_goals.append(goals_reached)
-        avg_goals = np.mean(episode_goals)
-        episode_steps.append(step)
-        avg_steps = np.mean(episode_steps)
-        metrics_log['Episodio'].append(episode)
-        metrics_log['Recompensa_Episodio'].append(episode_reward)
-        metrics_log['Recompensa_Promedio_Movil'].append(avg_reward)
-        metrics_log['Pasos_Episodio'].append(step)
-        metrics_log['Pasos_Promedio_Movil'].append(avg_steps)
-        metrics_log['Metas_Alcanzadas_Episodio'].append(goals_reached)
-        metrics_log['Metas_Alcanzadas_Promedio_Movil'].append(avg_goals)
-
-        # Registrar promedio de pérdidas del episodio (o último valor si solo hay uno)
+        # Inicializar listas para pérdidas comunes (si existen en loss_dict)
+        possible_losses = ['loss', 'policy_loss', 'value_loss', 'actor_loss', 'critic_loss', 'entropy_loss', 'alpha_loss', 'alpha', 'epsilon']
         for loss_name in possible_losses:
-            values = episode_losses.get(loss_name, [])
-            if values:
-                metrics_log[loss_name].append(np.mean(values))
-            else:
-                # Si no hubo entrenamiento o no se devolvió esa pérdida, añadir NaN o un marcador
-                # Asegurarse que todas las listas tengan la misma longitud
-                metrics_log[loss_name].append(np.nan)
+            metrics_log[loss_name] = []
 
-        if episode % print_interval == 0:
-            loss_str = ", ".join([f"{k}: {v[-1]:.3f}" for k, v in metrics_log.items() if k not in ['Episodio', 'Recompensa_Episodio', 'Pasos_Episodio', 'Pasos_Totales', 'Recompensa_Promedio_Movil'] and not np.isnan(v[-1])])
-            print(f"Alg: {alg_name.upper()} | Episodio: {episode}/{num_episodes} | Pasos: {step} | Recompensa Ep: {episode_reward:.2f} | Recompensa Prom (Últimos {print_interval}): {avg_reward:.2f} | Metas Ep: {goals_reached} | Pérdida {loss_str}")
-            if 'loss_dict' in locals():
-                print(f"\tLosses: {loss_dict}")
+        episode_rewards = deque(maxlen=print_interval) # Almacenar recompensas recientes para promedio
+        episode_goals = deque(maxlen=print_interval)   # Almacenar las metas alcanzadas recientes para promedio
+        episode_steps = deque(maxlen=print_interval)   # Almacenar las pasos alcanzados recientes para promedio
+        next_save_episode = 1 # Inicializar el próximo número de episodio para guardar
 
-        # Lógica de Guardado Exponencial
-        if episode == next_save_episode:
-            checkpoint_filename = f"{alg_name}_ep{episode}_model.pth"
-            checkpoint_path = os.path.join(save_dir, checkpoint_filename)
-            try:
-                agent.save(checkpoint_path)
-                print(f"Punto de control guardado en {checkpoint_path}")
-            except Exception as e:
-                print(f"Error al guardar el punto de control en {checkpoint_path}: {e}")
-            if next_save_episode >= 1:
-                next_save_episode *= 10
-            else:
-                next_save_episode = 10
+        for episode in range(1, num_episodes + 1):
+            state = env.reset()
+            episode_reward = 0
+            step = 0
+            goals_reached = 0
+            done = False
+            if hasattr(agent, 'memory_ready'): # Reiniciar flag de memoria de PPO si el agente lo tiene
+                agent.memory_ready = False
+            
+            episode_losses = {loss_name: [] for loss_name in possible_losses} # Para promediar pérdidas del episodio
 
-            # Guardar CSV parcial en cada checkpoint
-            try:
-                df_partial = pd.DataFrame(metrics_log)
-                df_partial.to_csv(csv_filename, index=False)
-                print(f"CSV parcial guardado en {csv_filename}")
-            except Exception as e_csv:
-                print(f"Error guardando CSV parcial: {e_csv}")
+            while not done:
+                if alg_name == "ppo" and agent.memory_ready:
+                    try:
+                        loss_dict = agent.train(last_state=state, last_done=done)
+                        for key, value in loss_dict.items():
+                            if key in episode_losses:
+                                episode_losses[key].append(value)
+                    except Exception as e_train:
+                        print(f"Error durante agent.train() [PPO Pre-Action] en episodio {episode}: {e_train}")
+
+                action = agent.select_action(state)
+                next_state, reward, done, info = env.step(action)
+
+                if info.get("segment_goal_reached", False):
+                    goals_reached += 1
+
+                episode_reward += reward
+                step += 1
+
+                if alg_name == "ppo":
+                    # PPO almacena el resultado después del paso
+                    agent.store_outcome(reward, done)
+                elif alg_name in ["ddqn", "sac"]:
+                    # DDQN/SAC almacenan la transición completa
+                    agent.store_transition(state, action, reward, next_state, done)
+                    # Verificar si la memoria del agente (buffer) tiene suficientes muestras
+                    memory_attr = getattr(agent, 'memory', None)
+                    batch_size_key = config[alg_name].get('batch_size')
+                    if memory_attr is not None and batch_size_key is not None and len(memory_attr) >= batch_size_key:
+                        loss_dict = agent.train()
+
+                state = next_state
+
+                if done:
+                    # Si PPO terminó el episodio antes de n_steps, entrenar con datos parciales
+                    if alg_name == "ppo" and not agent.memory_ready:
+                        # Verificar si hay alg con qué entrenar
+                        if hasattr(agent, 'memory') and len(agent.memory.get('states', [])) > 0:
+                            print(f"PPO Episodio {episode} terminó temprano, entrenando con datos parciales ({len(agent.memory['states'])} pasos)...")
+                            try: 
+                                loss_dict = agent.train(last_state=state, last_done=done)
+                                for key, value in loss_dict.items():
+                                    if key in episode_losses:
+                                        episode_losses[key].append(value)
+                            except Exception as e:
+                                print(f"Error durante agent.train() [PPO Post-Done] en episodio {episode}: {e}")
+                        if hasattr(agent, 'memory_ready'):
+                            agent.memory_ready = False
+                    break
+
+            # Registro de Métricas del Episodio
+            episode_rewards.append(episode_reward)
+            avg_reward = np.mean(episode_rewards)
+            episode_goals.append(goals_reached)
+            avg_goals = np.mean(episode_goals)
+            episode_steps.append(step)
+            avg_steps = np.mean(episode_steps)
+            metrics_log['Episodio'].append(episode)
+            metrics_log['Recompensa_Episodio'].append(episode_reward)
+            metrics_log['Recompensa_Promedio_Movil'].append(avg_reward)
+            metrics_log['Pasos_Episodio'].append(step)
+            metrics_log['Pasos_Promedio_Movil'].append(avg_steps)
+            metrics_log['Metas_Alcanzadas_Episodio'].append(goals_reached)
+            metrics_log['Metas_Alcanzadas_Promedio_Movil'].append(avg_goals)
+
+            # Registrar promedio de pérdidas del episodio (o último valor si solo hay uno)
+            for loss_name in possible_losses:
+                values = episode_losses.get(loss_name, [])
+                if values:
+                    metrics_log[loss_name].append(np.mean(values))
+                else:
+                    # Si no hubo entrenamiento o no se devolvió esa pérdida, añadir NaN o un marcador
+                    # Asegurarse que todas las listas tengan la misma longitud
+                    metrics_log[loss_name].append(np.nan)
+
+            if episode % print_interval == 0:
+                loss_str = ", ".join([f"{k}: {v[-1]:.3f}" for k, v in metrics_log.items() if k not in ['Episodio', 'Recompensa_Episodio', 'Pasos_Episodio', 'Pasos_Totales', 'Recompensa_Promedio_Movil'] and not np.isnan(v[-1])])
+                print(f"Alg: {alg_name.upper()} | Episodio: {episode}/{num_episodes} | Pasos: {step} | Recompensa Ep: {episode_reward:.2f} | Recompensa Prom (Últimos {print_interval}): {avg_reward:.2f} | Metas Ep: {goals_reached} | Pérdida {loss_str}")
+                if 'loss_dict' in locals():
+                    print(f"\tLosses: {loss_dict}")
+
+            # Lógica de Guardado Exponencial
+            if episode == next_save_episode:
+                checkpoint_filename = f"{alg_name}_ep{episode}_model.pth"
+                checkpoint_path = os.path.join(save_dir, checkpoint_filename)
+                try:
+                    agent.save(checkpoint_path)
+                    print(f"Punto de control guardado en {checkpoint_path}")
+                except Exception as e:
+                    print(f"Error al guardar el punto de control en {checkpoint_path}: {e}")
+                if next_save_episode >= 1:
+                    next_save_episode *= 10
+                else:
+                    next_save_episode = 10
+
+                # Guardar CSV parcial en cada checkpoint
+                try:
+                    df_partial = pd.DataFrame(metrics_log)
+                    df_partial.to_csv(csv_filename, index=False)
+                    print(f"CSV parcial guardado en {csv_filename}")
+                except Exception as e_csv:
+                    print(f"Error guardando CSV parcial: {e_csv}")
 
 
-    final_filename = f"{alg_name}_final_model.pth"
-    final_save_path = os.path.join(save_dir, final_filename)
-    try:
-        agent.save(final_save_path)
-        print(f"Modelo final guardado en {final_save_path}")
+        final_filename = f"{alg_name}_final_model.pth"
+        final_save_path = os.path.join(save_dir, final_filename)
+        try:
+            agent.save(final_save_path)
+            print(f"Modelo final guardado en {final_save_path}")
+        except Exception as e:
+            print(f"Error al guardar el modelo final en {final_save_path}: {e}")
+
+        # Guardar CSV final
+        try:
+            df_final = pd.DataFrame(metrics_log)
+            df_final.to_csv(csv_filename, index=False)
+            print(f"CSV final guardado en {csv_filename}")
+            # Generar gráficos
+            plot_metrics_list = ['Recompensa_Episodio', 'Recompensa_Promedio_Movil', 'Pasos_Episodio', 'Pasos_Promedio_Movil', 'Metas_Alcanzadas_Episodio', 'Metas_Alcanzadas_Promedio_Movil']
+            # Añadir pérdidas que realmente se registraron
+            plot_metrics_list.extend([k for k, v in metrics_log.items() if k in possible_losses and any(not np.isnan(val) for val in v)])
+            plot_metrics(df_final, plot_metrics_list, results_dir, f"train_{alg_name}")
+        except Exception as e_final:
+            print(f"Error guardando CSV final o generando gráficos: {e_final}")
+
+        print(f"--- Entrenamiento Finalizado: {alg_name.upper()} ---")
+        env.close()
     except Exception as e:
-        print(f"Error al guardar el modelo final en {final_save_path}: {e}")
+        print(f"Error durante el entrenamiento de '{alg_name}': {str(e)}")
+    finally:
+        print(f"Deteniendo CodeCarbon tracker para {alg_name}...")
+        emissions: float = tracker.stop()
+        if emissions is not None:
+            print(f"Emisiones estimadas para el entrenamiento de {alg_name}: {emissions:.6f} kg CO2eq")
+        else:
+            print("No se pudieron obtener datos de emisiones de CodeCarbon.")
 
-    # Guardar CSV final
-    try:
-        df_final = pd.DataFrame(metrics_log)
-        df_final.to_csv(csv_filename, index=False)
-        print(f"CSV final guardado en {csv_filename}")
-        # Generar gráficos
-        plot_metrics_list = ['Recompensa_Episodio', 'Recompensa_Promedio_Movil', 'Pasos_Episodio', 'Pasos_Promedio_Movil', 'Metas_Alcanzadas_Episodio', 'Metas_Alcanzadas_Promedio_Movil']
-        # Añadir pérdidas que realmente se registraron
-        plot_metrics_list.extend([k for k, v in metrics_log.items() if k in possible_losses and any(not np.isnan(val) for val in v)])
-        plot_metrics(df_final, plot_metrics_list, results_dir, f"train_{alg_name}")
-    except Exception as e_final:
-        print(f"Error guardando CSV final o generando gráficos: {e_final}")
-
-    print(f"--- Entrenamiento Finalizado: {alg_name.upper()} ---")
-    env.close()
 
 
 def train_a3c_agent(agent: A3CAgent, config: Dict, save_dir: str):
