@@ -1168,7 +1168,7 @@ class SUMOEnvironment:
         comando = [
             "ffmpeg",
             "-framerate", "10",                 # Velocidad de fotogramas
-            "-i", "frames/frame_%04d.png",       # Patrón de los archivos de imagen
+            "-i", f"frames/frame_{self.alg_name}_%04d.png",       # Patrón de los archivos de imagen
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-y",
