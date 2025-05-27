@@ -104,10 +104,10 @@ def plot_comparison_graphs(
                 print(f"Error cargando o ploteando datos de {csv_path} para {alg_name.upper()}: {e}")
 
         if any_data_plotted:
-            plt.title(plot_title, fontsize=16)
-            plt.xlabel("Episodio", fontsize=12)
-            plt.ylabel(metric_col_name.replace("_", " ").title(), fontsize=12)
-            plt.legend(title="Algoritmo", fontsize=10)
+            plt.title(plot_title, fontsize=24)
+            plt.xlabel("Episodio", fontsize=24)
+            plt.ylabel(metric_col_name.replace("_", " ").title(), fontsize=24)
+            plt.legend(title="Algoritmo", fontsize=36)
             plt.tight_layout()
             plot_filename_safe = plot_title.lower().replace(" ", "_").replace("(", "").replace(")", "")
             save_path = os.path.join(output_dir, f"comparison_{mode}_{plot_filename_safe}.png")
